@@ -140,17 +140,6 @@ namespace Neo.SmartContract
             ContractManagement.Update(nef, manifest);
         }
 
-        public static void AddRoot(string root)
-        {
-            CheckCommittee();
-            if (!CheckFragment(root, true))
-                throw new FormatException("The format of the root is incorrect.");
-            StorageMap rootMap = new(Storage.CurrentContext, Prefix_Root);
-            if (rootMap[root] is not null)
-                throw new InvalidOperationException("The root already exists.");
-            rootMap.Put(root, 0);
-        }
-
         [Safe]
         public static Iterator Roots()
         {
@@ -188,13 +177,13 @@ namespace Neo.SmartContract
             StorageMap nameMap = new(context, Prefix_Name);
             string[] fragments = SplitAndCheck(name, false);
             if (fragments is null) throw new FormatException("The format of the name is incorrect.");
-            if (rootMap[fragments[^1]] is null) throw new Exception("The root does not exist.");
+            if (rootMap[fragments[^1]] is null)  {
+                if (fragments.Length != 1) throw new InvalidOperationException("The TLD is not found");
+                return true;
+            }
             long price = GetPrice((byte)fragments[0].Length);
             if (price < 0) return false;
-            ByteString buffer = nameMap[GetKey(name)];
-            if (buffer is null) return true;
-            NameState token = (NameState)StdLib.Deserialize(buffer);
-            return Runtime.Time >= token.Expiration;
+            return parentExpired(nameMap, 0, fragments);
         }
 
         public static bool Register(string name, UInt160 owner)
@@ -206,7 +195,15 @@ namespace Neo.SmartContract
             StorageMap nameMap = new(context, Prefix_Name);
             string[] fragments = SplitAndCheck(name, false);
             if (fragments is null) throw new FormatException("The format of the name is incorrect.");
-            if (rootMap[fragments[^1]] is null) throw new Exception("The root does not exist.");
+            ByteString tld = rootMap[fragments[^1]];
+            if (fragments.Length == 1) {
+                CheckCommittee();
+                if (tld is not null) throw new InvalidOperationException("TLD already exists.");
+                rootMap.Put(fragments[^1], 0);
+            } else {
+                if (tld is null) throw new InvalidOperationException("TLD does not exist.");
+                if (parentExpired(nameMap, 1, fragments)) throw new InvalidOperationException("One of the parent domains has expired.");
+            }
             if (!Runtime.CheckWitness(owner)) throw new InvalidOperationException("No authorization.");
             long price = GetPrice((byte)fragments[0].Length);
             if (price < 0)
@@ -306,8 +303,7 @@ namespace Neo.SmartContract
             StorageContext context = Storage.CurrentContext;
             StorageMap nameMap = new(context, Prefix_Name);
             StorageMap recordMap = new(context, Prefix_Record);
-            string[] fragments = SplitAndCheck(name, true);
-            if (fragments is null) throw new FormatException("The format of the name is incorrect.");
+            string tokenId = tokenIDFromName(name);
             switch (type)
             {
                 case RecordType.A:
@@ -325,7 +321,6 @@ namespace Neo.SmartContract
                 default:
                     throw new InvalidOperationException("The record type is not supported.");
             }
-            string tokenId = name[^(fragments[^2].Length + fragments[^1].Length + 1)..];
             ByteString tokenKey = GetKey(tokenId);
             NameState token = (NameState)StdLib.Deserialize(nameMap[tokenKey]);
             token.EnsureNotExpired();
@@ -345,9 +340,7 @@ namespace Neo.SmartContract
             StorageContext context = Storage.CurrentContext;
             StorageMap nameMap = new(context, Prefix_Name);
             StorageMap recordMap = new(context, Prefix_Record);
-            string[] fragments = SplitAndCheck(name, true);
-            if (fragments is null) throw new FormatException("The format of the name is incorrect.");
-            string tokenId = name[^(fragments[^2].Length + fragments[^1].Length + 1)..];
+            string tokenId = tokenIDFromName(name);
             ByteString tokenKey = GetKey(tokenId);
             NameState token = (NameState)StdLib.Deserialize(nameMap[tokenKey]);
             token.EnsureNotExpired();
@@ -373,9 +366,7 @@ namespace Neo.SmartContract
             StorageContext context = Storage.CurrentContext;
             StorageMap nameMap = new(context, Prefix_Name);
             StorageMap recordMap = new(context, Prefix_Record);
-            string[] fragments = SplitAndCheck(name, true);
-            if (fragments is null) throw new FormatException("The format of the name is incorrect.");
-            string tokenId = name[^(fragments[^2].Length + fragments[^1].Length + 1)..];
+            string tokenId = tokenIDFromName(name);
             ByteString tokenKey = GetKey(tokenId);
             NameState token = (NameState)StdLib.Deserialize(nameMap[tokenKey]);
             token.EnsureNotExpired();
@@ -409,9 +400,7 @@ namespace Neo.SmartContract
             StorageContext context = Storage.CurrentContext;
             StorageMap nameMap = new(context, Prefix_Name);
             StorageMap recordMap = new(context, Prefix_Record);
-            string[] fragments = SplitAndCheck(name, true);
-            if (fragments is null) throw new FormatException("The format of the name is incorrect.");
-            string tokenId = name[^(fragments[^2].Length + fragments[^1].Length + 1)..];
+            string tokenId = tokenIDFromName(name);
             ByteString tokenKey = GetKey(tokenId);
             NameState token = (NameState)StdLib.Deserialize(nameMap[tokenKey]);
             token.EnsureNotExpired();
@@ -503,7 +492,7 @@ namespace Neo.SmartContract
             if (length < 3 || length > NameMaxLength) return null;
             string[] fragments = StdLib.StringSplit(name, ".");
             length = fragments.Length;
-            if (length < 2 || length > 8) return null;
+            if (length > 8) return null;
             if (length > 2 && !allowMultipleFragments) return null;
             for (int i = 0; i < length; i++)
                 if (!CheckFragment(fragments[i], i == length - 1))
@@ -602,6 +591,38 @@ namespace Neo.SmartContract
                 if (number < 0x200 || number == 0xdb8) return false;
             }
             return true;
+        }
+
+        /// <summary>
+        /// Returns true if any domain from fragments doesn't exist or expired.
+        /// </summary>
+        /// <param name="nameMap">Registered domain names storage map.</param>
+        /// <param name="first">The deepest subdomain to check.</param>
+        /// <param name="fragments">The array of domain name fragments.</param>
+        /// <returns>Whether any domain fragment doesn't exist or expired.</returns>
+        private static bool parentExpired(StorageMap nameMap, int first, string[] fragments) {
+            int last = fragments.Length - 1;
+            string name = fragments[last];
+            for (int i = last; i >= first; i--) {
+                if (i != last) {
+                    name = fragments[i] + "." + name;
+                }
+                ByteString buffer = nameMap[GetKey(name)];
+                if (buffer is null) return true;
+                NameState token = (NameState)StdLib.Deserialize(buffer);
+                if (Runtime.Time >= token.Expiration) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Checks provided name for validness and returns corresponding token ID.
+        /// </summary>
+        private static string tokenIDFromName(string name) {
+            string[] fragments = SplitAndCheck(name, true);
+            if (fragments is null) throw new FormatException("The format of the name is incorrect.");
+            if (fragments.Length == 1) return name;
+            return name[^(fragments[^2].Length + fragments[^1].Length + 1)..];
         }
     }
 }
