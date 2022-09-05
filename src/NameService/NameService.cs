@@ -203,6 +203,9 @@ namespace Neo.SmartContract
             } else {
                 if (tld is null) throw new InvalidOperationException("TLD does not exist.");
                 if (parentExpired(nameMap, 1, fragments)) throw new InvalidOperationException("One of the parent domains has expired.");
+                ByteString parentKey = GetKey(fragments[1]);
+                NameState token = (NameState)StdLib.Deserialize(nameMap[parentKey]);
+                token.CheckAdmin();
             }
             if (!Runtime.CheckWitness(owner)) throw new InvalidOperationException("No authorization.");
             long price = GetPrice((byte)fragments[0].Length);
