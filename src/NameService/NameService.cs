@@ -343,6 +343,7 @@ namespace Neo.SmartContract
             ByteString tokenKey = GetKey(tokenId);
             byte[] recordKey = GetRecordKey(tokenKey, name, type);
             RecordState record = (RecordState)recordMap.GetObject(recordKey);
+            if (record is null) return null;
             return record.Data;
         }
 
